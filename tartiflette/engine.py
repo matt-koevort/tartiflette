@@ -1,8 +1,10 @@
+import collections
 import logging
+from asyncio import Event, ensure_future, wait, FIRST_COMPLETED
 
 from functools import partial
 from importlib import import_module, invalidate_caches
-from inspect import isawaitable
+from inspect import isawaitable, isasyncgen
 from typing import (
     Any,
     AsyncIterable,
@@ -373,27 +375,15 @@ class Engine:
         context: Optional[Any] = None,
         variables: Optional[Dict[str, Any]] = None,
         initial_value: Optional[Any] = None,
-    ) -> AsyncIterable[Dict[str, Any]]:
-        """
-        Parses and executes a GraphQL subscription request.
-        :param query: the GraphQL request / query as UTF8-encoded string
-        :param operation_name: the operation name to execute
-        :param context: value that can contain everything you need and that
-        will be accessible from the resolvers
-        :param variables: the variables provided in the GraphQL request
-        :param initial_value: an initial value corresponding to the root type
-        being executed
-        :type query: Union[str, bytes]
-        :type operation_name: Optional[str]
-        :type context: Optional[Any]
-        :type variables: Optional[Dict[str, Any]]
-        :type initial_value: Optional[Any]
-        :return: computed response corresponding to the request
-        :rtype: AsyncIterable[Dict[str, Any]]
-        """
+    ):
+        async def one_shot(result):
+            yield result
 
         document, errors = parse_and_validate_query(query, self._schema)
+        if errors:
+            return one_shot(await self._build_response(errors=errors))
 
+<<<<<<< Updated upstream
         # Goes through potential schema directives and finish in self._perform_subscription
         async for payload in self._subscription_executor(
             self._schema,
@@ -406,3 +396,102 @@ class Engine:
             context_coercer=context,
         ):
             yield payload
+=======
+        try:
+            source_event_stream = await create_source_event_stream(
+                self._schema,
+                document,
+                self._build_response,
+                initial_value,
+                context,
+                variables,
+                operation_name,
+            )
+        except Exception as e:
+            return one_shot(await self._build_response(errors=[e]))
+
+        if isinstance(source_event_stream, dict):
+            return one_shot(source_event_stream)
+
+        # source_event_stream
+
+        async def map_source_to_response_event(payload):
+            return await execute(
+                self._schema,
+                document,
+                self._build_response,
+                payload,
+                context,
+                variables,
+                operation_name,
+            )
+
+        return NoWay(
+            source_event_stream,
+            map_source_to_response_event,
+        )
+
+
+class NoWay(collections.abc.AsyncGenerator):
+    def __init__(self, source_event_stream, map_source_to_response_event):
+        self._source_event_stream = source_event_stream
+        self._map_source_to_response_event = map_source_to_response_event
+        self._close_event = Event()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.is_closed:
+            raise StopAsyncIteration()
+
+        aclose = ensure_future(self._close_event.wait())
+        anext = ensure_future(self._source_event_stream.__anext__())
+
+        _, pending = await wait(
+            {aclose, anext}, return_when=FIRST_COMPLETED
+        )
+        for task in pending:
+            print("-> NoWay.__anext__.pending_cancellation")
+            task.cancel()
+
+        if aclose.done():
+            raise StopAsyncIteration()
+        return await self._map_source_to_response_event(anext.result())
+
+    async def asend(self, value):
+        return await super().asend(value)
+
+    async def athrow(self, typ, val=None, tb=None):
+        if self.is_closed:
+            return
+        athrow = getattr(self._source_event_stream, "athrow", None)
+        if athrow is not None:
+            return await athrow(typ, val, tb)
+        return await super().athrow(typ, val, tb)
+
+    async def aclose(self):
+        print("-> NoWay.aclose", self.is_closed)
+        if self.is_closed:
+            return
+
+        aclose = getattr(self._source_event_stream, "aclose", None)
+        if aclose is not None:
+            print("*> NoWay.source_event_stream.aclose", self.is_closed)
+            await aclose()
+            print("*> NoWay.source_event_stream.aclosed", self.is_closed)
+        else:
+            await super().aclose()
+        self.is_closed = True
+
+    @property
+    def is_closed(self):
+        return self._close_event.is_set()
+
+    @is_closed.setter
+    def is_closed(self, value):
+        if value:
+            self._close_event.set()
+        else:
+            self._close_event.clear()
+>>>>>>> Stashed changes
